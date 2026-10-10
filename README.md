@@ -6,6 +6,10 @@
 
 VLC plugin that allows you to pause/play a video by clicking on the video image.
 
+> **This fork: Apple Silicon (arm64) macOS build + working double click on macOS.**
+> Native arm64 build for VLC 3.0.x on Apple Silicon Macs, and a fix so that double-click-to-fullscreen no longer pauses the video on macOS.
+> See [macos/README.md](macos/README.md) ([日本語](macos/README.ja.md)).
+
 By default it pauses on every click, but it can be configured to work nicely with double-click-to-fullscreen by enabling ["Prevent pause/play from triggering on double click" option in the settings](http://i.imgur.com/Kdrekks.png).
 
 (As an extra functionality, it also allows mouse key re-assignment.

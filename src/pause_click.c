@@ -87,7 +87,13 @@ static const int mouse_button_values[] = {-1, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_CE
 #define ENABLE_DOUBLE_CLICK_DELAY_DEFAULT false
 
 #define IGNORE_DOUBLE_CLICK_CFG CFG_PREFIX "ignore-double-click"
+// macOS: enabled by default, since the macOS-specific double-click handling
+// (see mouse()) is what makes double-click-to-fullscreen usable there.
+#ifdef __APPLE__
+#define IGNORE_DOUBLE_CLICK_DEFAULT true
+#else
 #define IGNORE_DOUBLE_CLICK_DEFAULT false
+#endif
 
 #define DISABLE_FS_TOGGLE_CFG CFG_PREFIX "disable-fs-toggle"
 #define DISABLE_FS_TOGGLE_DEFAULT false
@@ -115,6 +121,12 @@ static intf_thread_t *p_intf = NULL;
 static vlc_timer_t timer;
 static bool timer_initialized = false;
 static atomic_bool timer_scheduled;
+// macOS only: fullscreen state captured at the moment of the click that armed
+// the timer, used to detect double clicks after the fact (see mouse()).
+static atomic_int fs_at_click;
+// macOS only: whether we already toggled pause/play on the press (1) or
+// deferred it until the timer fires (0). See mouse() / timer_callback().
+static atomic_int toggled_on_click;
 
 // VLC 4.0 removed the advanced flag in 3716a7da5ba8dc30dbd752227c6a893c71a7495b
 #if LIBVLC_VERSION_MAJOR >= 4
@@ -432,6 +444,41 @@ static void pause_play(void)
 #endif
 }
 
+// Returns the current fullscreen state (1 or 0), or -1 if it can't be
+// determined. Used on macOS to detect a double click indirectly: see the
+// comment in mouse().
+static int get_fullscreen(void)
+{
+    if (!p_intf) {
+        return -1;
+    }
+    playlist_t* p_playlist = pl_Get(p_intf);
+    if (var_Type(p_playlist, "fullscreen") == 0) {
+        return -1;
+    }
+    return var_GetBool(p_playlist, "fullscreen") ? 1 : 0;
+}
+
+// Returns 1 if currently playing, 0 if paused/stopped, -1 if unknown.
+static int is_playing(void)
+{
+    if (!p_intf) {
+        return -1;
+    }
+#if 2 <= LIBVLC_VERSION_MAJOR && LIBVLC_VERSION_MAJOR <= 3
+    playlist_t* p_playlist = pl_Get(p_intf);
+    return playlist_Status(p_playlist) == PLAYLIST_RUNNING ? 1 : 0;
+#elif LIBVLC_VERSION_MAJOR >= 4
+    vlc_player_t* player = vlc_playlist_GetPlayer(vlc_intf_GetMainPlaylist(p_intf));
+    vlc_player_Lock(player);
+    int state = vlc_player_GetState(player);
+    vlc_player_Unlock(player);
+    return state == VLC_PLAYER_STATE_PLAYING ? 1 : 0;
+#else
+    return -1;
+#endif
+}
+
 static void timer_callback(void* data)
 {
     if (!atomic_load(&timer_scheduled)) {
@@ -440,9 +487,36 @@ static void timer_callback(void* data)
 
     filter_t *p_filter = (filter_t *) data;
     msg_Dbg(p_filter, "delayed click: timer expired");
+
+#ifdef __APPLE__
+    // macOS double-click handling (see mouse()). Whether we already toggled
+    // pause/play on the press depends on the play state at click time:
+    //   - was playing  -> we paused immediately on the press (snappy)
+    //   - was paused   -> we deferred, to avoid a visible playback blip
+    // Now that the double-click window has elapsed, reconcile using whether the
+    // fullscreen state changed (i.e. it was a double click):
+    int fs_before = atomic_load(&fs_at_click);
+    int fs_now = get_fullscreen();
+    bool fs_toggled = (fs_before >= 0 && fs_now >= 0 && fs_before != fs_now);
+    bool toggled_on_press = atomic_load(&toggled_on_click);
+    if (fs_toggled && toggled_on_press) {
+        // double click, but we already toggled on the press -> undo it
+        msg_Dbg(p_filter, "double click (fs %d->%d); undoing the pause/play done on press", fs_before, fs_now);
+        pause_play();
+    } else if (!fs_toggled && !toggled_on_press) {
+        // single click that we deferred (was paused) -> perform it now
+        msg_Dbg(p_filter, "single click (deferred); performing pause/play now");
+        pause_play();
+    }
+    // (fs_toggled && !toggled_on_press): double click from paused -> we deferred
+    //   and correctly did nothing, leave it paused.
+    // (!fs_toggled && toggled_on_press): single click from playing -> already
+    //   paused on press, nothing to do.
+#else
     if (var_InheritBool(p_filter, IGNORE_DOUBLE_CLICK_CFG)) {
         pause_play();
     }
+#endif
 
     atomic_store(&timer_scheduled, false);
 }
@@ -495,6 +569,50 @@ static int mouse(filter_t *p_filter, vlc_mouse_t *p_mouse_out, const vlc_mouse_t
         p_mouse_out->b_double_click = 0;
     }
 
+#ifdef __APPLE__
+    // macOS: the Cocoa video output consumes the second click of a double click
+    // for its native fullscreen toggle, so this filter only ever receives a
+    // single press for a double click -- there is no b_double_click flag and no
+    // second press, which makes a single click and a double click
+    // indistinguishable at press time. We detect a double click after the fact
+    // by watching whether the fullscreen state changes within the double-click
+    // window, then reconcile in timer_callback().
+    //
+    // How we act on the press depends on the current play state, to avoid an
+    // ugly playback blip:
+    //   - playing -> pause immediately (snappy single click). If it turns out to
+    //     be a double click, timer_callback() resumes. The brief pause is hidden
+    //     by the fullscreen animation, so it's unnoticeable.
+    //   - paused  -> do NOT resume immediately, because a double click would then
+    //     briefly play the video before pausing again (a visible jump). Instead
+    //     defer: if it was a single click, timer_callback() resumes; if it was a
+    //     double click, it stays paused with no blip.
+    //
+    // Setting IGNORE_DOUBLE_CLICK to false disables all of this and restores
+    // plain pause/play on every click.
+    if (vlc_mouse_HasPressed(p_mouse_old, p_mouse_new, mouse_button)) {
+        if (var_InheritBool(p_filter, IGNORE_DOUBLE_CLICK_CFG) &&
+                mouse_button == MOUSE_BUTTON_LEFT && timer_initialized) {
+            int playing = is_playing();
+            if (playing == 1) {
+                // playing: pause now for a snappy response, undo later if double click
+                pause_play();
+                atomic_store(&toggled_on_click, 1);
+            } else {
+                // paused/unknown: defer to avoid a playback blip on double click
+                atomic_store(&toggled_on_click, 0);
+            }
+            atomic_store(&fs_at_click, get_fullscreen());
+            atomic_store(&timer_scheduled, true);
+            int64_t delay = var_InheritInteger(p_filter, DOUBLE_CLICK_DELAY_CFG);
+            vlc_timer_schedule(timer, false, delay*1000, 0);
+            msg_Dbg(p_filter, "click: playing=%d toggled_on_press=%d; reconciling in %" PRId64 "ms", playing, playing == 1, delay);
+        } else {
+            // option disabled or non-pause button: plain pause/play on every click
+            pause_play();
+        }
+    }
+#else
     // react only on the configured mouse button click
     if (vlc_mouse_HasPressed(p_mouse_old, p_mouse_new, mouse_button)
 #if LIBVLC_VERSION_MAJOR <= 3
@@ -525,6 +643,7 @@ static int mouse(filter_t *p_filter, vlc_mouse_t *p_mouse_out, const vlc_mouse_t
             }
         }
     }
+#endif
 
     // prevent fullscreen from toggling on double click
     if (var_InheritBool(p_filter, DISABLE_FS_TOGGLE_CFG) &&
@@ -630,6 +749,8 @@ static int OpenFilter(vlc_object_t *p_this)
     }
     timer_initialized = true;
     atomic_store(&timer_scheduled, false);
+    atomic_store(&fs_at_click, -1);
+    atomic_store(&toggled_on_click, 0);
 
     return VLC_SUCCESS;
 }
